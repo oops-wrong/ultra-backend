@@ -3,6 +3,10 @@
 ## Install the app
 * `cd backend`
 * `npm i`
+* place files to `/var/www/ultra-assets/`
+  * https://ultra-course-generator-bucket.s3.us-east-2.amazonaws.com/silence.mp3
+  * https://ultra-course-generator-bucket.s3.us-east-2.amazonaws.com/intro.mp4
+  * https://ultra-course-generator-bucket.s3.us-east-2.amazonaws.com/intro720.mp4
 
 ## Run project
 * `npm run start:dev`

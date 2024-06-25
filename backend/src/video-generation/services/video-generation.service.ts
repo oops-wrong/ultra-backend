@@ -1,15 +1,17 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as ffmpegPath from 'ffmpeg-static';
+import * as ffprobe from 'ffprobe';
 import * as ffprobePath from 'ffprobe-static';
 import * as ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import { compact, round } from 'lodash';
 import { parseFile } from 'music-metadata';
+import * as path from 'path';
 import { cleanUpTempFiles } from '../../utils/common.utils';
 
 @Injectable()
 export class VideoGenerationService {
-  private readonly delayBetweenSlides = 1.5; // Delay between slides in seconds
+  private readonly delayBetweenSlides = 2; // Delay between slides in seconds
 
   constructor(private readonly _logger: Logger) {}
 
@@ -29,8 +31,8 @@ export class VideoGenerationService {
 
       const concatenateStart = new Date().getTime() / 1000;
 
-      await this.concatenateVideos([introVideoPath, ...tempVideos], outputFull);
-      await this.concatenateVideos([introVideoPath, tempVideos[0], tempVideos[1]], outputShort);
+      await this.processVideos([introVideoPath, ...tempVideos], 1, outputFull);
+      await this.processVideos([introVideoPath, tempVideos[0]], 1, outputShort);
 
       const concatenateEnd = new Date().getTime() / 1000;
       const concatenateDiff = round(concatenateEnd - concatenateStart, 2);
@@ -61,7 +63,7 @@ export class VideoGenerationService {
       const iterStart = new Date().getTime() / 1000;
 
       if (i === 0) {
-        const tempSilence = `temp_silence.mp4`;
+        const tempSilence = path.join('temp', `temp_silence.mp4`);
         await this.createVideoFromImageAndAudio({
           image: images[i],
           audio: '/var/www/ultra-assets/silence.mp3',
@@ -73,7 +75,7 @@ export class VideoGenerationService {
         processedVideos.push(tempSilence);
       }
 
-      const tempOutput = `temp_${i}.mp4`;
+      const tempOutput = path.join('temp', `temp_${i}.mp4`);
       const audioDuration = await this.getAudioDuration(audios[i]);
 
       await this.createVideoFromImageAndAudio({
@@ -157,32 +159,131 @@ export class VideoGenerationService {
     });
   }
 
-  private concatenateVideos(videos: string[], output: string): Promise<void> {
-    const concatList = videos.map((video) => `file '${video}'`).join('\n');
-    fs.writeFileSync('concat_list.txt', concatList);
+  // Function to check if file exists
+  private fileExists(filePath: string): boolean {
+    try {
+      return fs.existsSync(filePath);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // Function to get duration of a video file
+  private getVideoDuration(filePath: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      if (!this.fileExists(filePath)) {
+        return reject(new Error(`File does not exist: ${filePath}`));
+      }
+
+      ffprobe(filePath, { path: ffprobePath.path }, (err, info) => {
+        if (err) return reject(err);
+        const duration = parseInt(info.streams[0].duration, 10);
+        resolve(duration);
+      });
+    });
+  }
+
+  // Function to create crossfade effect between two videos
+  private async createCrossfade(
+    inputVideo1: string,
+    inputVideo2: string,
+    outputVideo: string,
+    crossfadeDuration: number,
+    delay: number,
+    currentIndex: number,
+    total: number,
+  ): Promise<string> {
+    const duration1 = await this.getVideoDuration(inputVideo1);
+    const transitionStart = Math.max(0, duration1 - crossfadeDuration);
 
     return new Promise((resolve, reject) => {
       ffmpeg()
-        .setFfmpegPath(ffmpegPath as unknown as string)
-        .setFfprobePath(ffprobePath.path)
-        .input('concat_list.txt')
-        .inputOptions(['-f concat', '-safe 0'])
-        .outputOptions(['-c copy'])
+        .input(inputVideo1)
+        .input(inputVideo2)
+        .complexFilter([
+          // Video crossfade
+          `[0:v]format=pix_fmts=yuva420p,fade=t=out:st=${transitionStart}:d=${crossfadeDuration}:alpha=1,setpts=PTS-STARTPTS[v0];` +
+          `[1:v]format=pix_fmts=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1,setpts=PTS-STARTPTS+${transitionStart}/TB[v1];` +
+          `[v0][v1]overlay,format=yuv420p[vid]`,
+          // Audio delay and concat
+          `[1:a]adelay=${delay}|${delay}[a1];` + `[0:a][a1]concat=n=2:v=0:a=1[aout]`,
+        ])
+        .outputOptions('-map', '[vid]')
+        .outputOptions('-map', '[aout]')
+        .outputOptions('-c:v', 'libx264')
+        .outputOptions('-c:a', 'aac')
+        .output(outputVideo)
         .on('start', (commandLine) => {
-          console.log('[ffmpeg]: Final. Spawned Ffmpeg with command: ' + commandLine);
+          console.log(
+            `[ffmpeg]: Crossfade (${currentIndex}/${total}). Spawned Ffmpeg with command: ${commandLine}`,
+          );
         })
+        .on('stderr', (stderrLine) =>
+          console.log(`[ffmpeg] Crossfade (${currentIndex}/${total}). ${stderrLine}`),
+        )
         .on('progress', (progress) => {
-          console.log(`[ffmpeg]: Final. Processing. Target size is ${progress.targetSize}kb`);
+          console.log(
+            `[ffmpeg]: Crossfade (${currentIndex}/${total}). Processing. Target size is ${progress.targetSize}kb`,
+          );
         })
         .on('end', () => {
-          console.log('[ffmpeg]: Final. End');
-          resolve();
+          console.log(`[ffmpeg]: Crossfade (${currentIndex}/${total}). End`);
+          resolve(outputVideo);
         })
         .on('error', (err) => {
-          console.error('[ffmpeg]: Final. Error', err);
+          console.error(`[ffmpeg]: Crossfade (${currentIndex}/${total}). Error ${err}`);
           reject(err);
         })
-        .save(output);
+        .run();
     });
+  }
+
+  // Function to create temp folder
+  private makeFolder(folder: string) {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder);
+    }
+  }
+
+  // Function to process list of videos from a text file
+  private async processVideos(
+    videoFiles: string[],
+    crossfadeDuration: number,
+    finalOutput: string,
+  ) {
+    try {
+      if (videoFiles.length < 2) {
+        throw new Error('At least two videos are required to create crossfade effect.');
+      }
+
+      let previousVideo = videoFiles[0];
+      let tempOutput: string;
+      this.makeFolder('temp');
+      const pauseDuration = crossfadeDuration;
+      let delay = pauseDuration;
+
+      for (let i = 1; i < videoFiles.length; i++) {
+        const currentVideo = videoFiles[i];
+        tempOutput = path.join('temp', `crossfade_${i}.mp4`);
+
+        await this.createCrossfade(
+          previousVideo,
+          currentVideo,
+          tempOutput,
+          crossfadeDuration,
+          delay,
+          i,
+          videoFiles.length - 1,
+        );
+
+        previousVideo = tempOutput;
+
+        // Increase delay for next video
+        delay += crossfadeDuration + pauseDuration;
+      }
+
+      fs.renameSync(tempOutput, finalOutput);
+      console.log('Final video with crossfade effect created successfully:', finalOutput);
+    } catch {}
   }
 }

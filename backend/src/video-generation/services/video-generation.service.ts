@@ -62,18 +62,18 @@ export class VideoGenerationService {
 
       const iterStart = new Date().getTime() / 1000;
 
-      if (i === 0) {
-        const tempSilence = path.join('temp', `temp_silence.mp4`);
-        await this.createVideoFromImageAndAudio({
-          image: images[i],
-          audio: '/var/www/ultra-assets/silence.mp3',
-          output: tempSilence,
-          audioDuration: 1,
-          delayBetweenSlides: 0,
-          is720p,
-        });
-        processedVideos.push(tempSilence);
-      }
+      // if (i === 0) {
+      //   const tempSilence = path.join('temp', `temp_silence.mp4`);
+      //   await this.createVideoFromImageAndAudio({
+      //     image: images[i],
+      //     audio: '/var/www/ultra-assets/silence.mp3',
+      //     output: tempSilence,
+      //     audioDuration: 1,
+      //     delayBetweenSlides: 0,
+      //     is720p,
+      //   });
+      //   processedVideos.push(tempSilence);
+      // }
 
       const tempOutput = path.join('temp', `temp_${i}.mp4`);
       const audioDuration = await this.getAudioDuration(audios[i]);
@@ -205,10 +205,13 @@ export class VideoGenerationService {
           `[0:v]format=pix_fmts=yuva420p,fade=t=out:st=${transitionStart}:d=${crossfadeDuration}:alpha=1,setpts=PTS-STARTPTS[v0];` +
           `[1:v]format=pix_fmts=yuva420p,fade=t=in:st=0:d=${crossfadeDuration}:alpha=1,setpts=PTS-STARTPTS+${transitionStart}/TB[v1];` +
           `[v0][v1]overlay,format=yuv420p[vid]`,
+          // Extend the last frame of the video to pause
+          `[vid]tpad=stop_mode=clone:stop_duration=${delay / 2}[viddelayed]`,
           // Audio delay and concat
-          `[1:a]adelay=${delay}|${delay}[a1];` + `[0:a][a1]concat=n=2:v=0:a=1[aout]`,
+          `[1:a]adelay=${delay * 1000}|${delay * 1000}[a1];` +
+          `[0:a][a1]concat=n=2:v=0:a=1[aout]`,
         ])
-        .outputOptions('-map', '[vid]')
+        .outputOptions('-map', '[viddelayed]')
         .outputOptions('-map', '[aout]')
         .outputOptions('-c:v', 'libx264')
         .outputOptions('-c:a', 'aac')
@@ -260,7 +263,6 @@ export class VideoGenerationService {
       let tempOutput: string;
       this.makeFolder('temp');
       const pauseDuration = crossfadeDuration;
-      let delay = pauseDuration;
 
       for (let i = 1; i < videoFiles.length; i++) {
         const currentVideo = videoFiles[i];
@@ -271,15 +273,12 @@ export class VideoGenerationService {
           currentVideo,
           tempOutput,
           crossfadeDuration,
-          delay,
+          pauseDuration,
           i,
           videoFiles.length - 1,
         );
 
         previousVideo = tempOutput;
-
-        // Increase delay for next video
-        delay += crossfadeDuration + pauseDuration;
       }
 
       fs.renameSync(tempOutput, finalOutput);

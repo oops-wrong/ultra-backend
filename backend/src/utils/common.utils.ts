@@ -1,4 +1,4 @@
-import * as fs from 'node:fs';
+import * as fs from 'fs';
 import * as uuid from 'uuid';
 
 export const escapeFileName = (fileName: string, maxLength = 200): string => {
@@ -18,10 +18,17 @@ export const escapeFileName = (fileName: string, maxLength = 200): string => {
 export const cleanUpTempFiles = async (tempFiles: string[]) => {
   for (const file of tempFiles) {
     if (fs.existsSync(file)) {
-      // todo skip removing the files
-      // await fs.promises.unlink(file);
+      await fs.promises.unlink(file);
     }
   }
 };
 
 export const getUuidName = () => uuid.v4().split('-')[0];
+
+export const fileExists = (filePath: string): boolean => {
+  try {
+    return fs.existsSync(filePath);
+  } catch (err) {
+    return false;
+  }
+};

@@ -7,11 +7,11 @@ import * as fs from 'fs';
 import { compact, round } from 'lodash';
 import { parseFile } from 'music-metadata';
 import * as path from 'path';
-import { cleanUpTempFiles } from '../../utils/common.utils';
+import { cleanUpTempFiles, fileExists } from '../../utils/common.utils';
 
 @Injectable()
 export class VideoGenerationService {
-  private readonly delayBetweenSlides = 2; // Delay between slides in seconds
+  private readonly delayBetweenSlides = 2.1; // Delay between slides in seconds
 
   constructor(private readonly _logger: Logger) {}
 
@@ -21,31 +21,26 @@ export class VideoGenerationService {
     audios: string[],
     outputFull: string,
     outputShort: string,
-    is720p: boolean,
     progressFn: (progress: number) => void,
   ): Promise<void> {
     let tempVideos: string[] = [];
+    let crossfades: string[] = [];
     const start = new Date().getTime() / 1000;
     try {
+      const is720p = (await this.getVideoAttribute(introVideoPath, 'height')) === 720;
       tempVideos = await this.processImageAudioPairs(images, audios, start, is720p, progressFn);
-
-      const concatenateStart = new Date().getTime() / 1000;
-
-      await this.processVideos([introVideoPath, ...tempVideos], 1, outputFull);
-      await this.processVideos([introVideoPath, tempVideos[0]], 1, outputShort);
-
-      const concatenateEnd = new Date().getTime() / 1000;
-      const concatenateDiff = round(concatenateEnd - concatenateStart, 2);
-      const totalDiff = round(concatenateEnd - start, 2);
-      console.log(`Concatenate took ${concatenateDiff}s. Total time is ${totalDiff}s`);
-      this._logger.log(
-        `Concatenate took ${concatenateDiff}s. Total time is ${totalDiff}s`,
-        VideoGenerationService.name,
+      crossfades = await this.processAllCrossfades(
+        tempVideos,
+        introVideoPath,
+        outputFull,
+        outputShort,
+        start,
+        progressFn,
       );
     } catch (error) {
       throw new Error(error);
     } finally {
-      cleanUpTempFiles(tempVideos).catch();
+      cleanUpTempFiles(tempVideos.concat(crossfades)).catch();
     }
   }
 
@@ -56,26 +51,14 @@ export class VideoGenerationService {
     is720p: boolean,
     progressFn: (progress: number) => void,
   ): Promise<string[]> {
-    const processedVideos = [];
+    const processedVideos: string[] = [];
     for (let i = 0; i < images.length; i++) {
-      progressFn(round((i / images.length) * 100, 0));
+      progressFn(round((i / images.length) * 50, 0));
 
       const iterStart = new Date().getTime() / 1000;
 
-      // if (i === 0) {
-      //   const tempSilence = path.join('temp', `temp_silence.mp4`);
-      //   await this.createVideoFromImageAndAudio({
-      //     image: images[i],
-      //     audio: '/var/www/ultra-assets/silence.mp3',
-      //     output: tempSilence,
-      //     audioDuration: 1,
-      //     delayBetweenSlides: 0,
-      //     is720p,
-      //   });
-      //   processedVideos.push(tempSilence);
-      // }
-
       const tempOutput = path.join('temp', `temp_${i}.mp4`);
+      processedVideos.push(tempOutput);
       const audioDuration = await this.getAudioDuration(audios[i]);
 
       await this.createVideoFromImageAndAudio({
@@ -83,21 +66,20 @@ export class VideoGenerationService {
         audio: audios[i],
         output: tempOutput,
         audioDuration,
-        delayBetweenSlides: this.delayBetweenSlides,
         is720p,
       });
-      processedVideos.push(tempOutput);
 
       const iterEnd = new Date().getTime() / 1000;
       const iterDiff = round(iterEnd - iterStart, 2);
       const totalDiff = round(iterEnd - start, 2);
-      console.log(`Iteration ${i} took ${iterDiff}s. Total time is ${totalDiff}s`);
-      this._logger.log(
-        `Iteration ${i} took ${iterDiff}s. Total time is ${totalDiff}s`,
-        VideoGenerationService.name,
-      );
+      this.log(`Slide iteration ${i} took ${iterDiff}s. Total time is ${totalDiff}s`);
     }
     return processedVideos;
+  }
+
+  private log(text: string) {
+    console.log(text);
+    this._logger.log(text, VideoGenerationService.name);
   }
 
   private async getAudioDuration(audio: string): Promise<number> {
@@ -105,7 +87,7 @@ export class VideoGenerationService {
       const metadata = await parseFile(audio);
       return metadata.format.duration; // duration is in seconds
     } catch (err) {
-      throw new Error(`Error getting audio duration: ${err.message}`);
+      throw new Error(`[ffmpeg]: Error getting audio duration: ${err.message}`);
     }
   }
 
@@ -114,16 +96,15 @@ export class VideoGenerationService {
     audio: string;
     output: string;
     audioDuration: number;
-    delayBetweenSlides: number;
     is720p: boolean;
   }): Promise<void> {
-    const { image, audio, output, audioDuration, delayBetweenSlides, is720p } = conf;
+    const { image, audio, output, audioDuration, is720p } = conf;
     return new Promise((resolve, reject) => {
       ffmpeg()
         .setFfmpegPath(ffmpegPath as unknown as string)
         .setFfprobePath(ffprobePath.path)
         .input(image)
-        .loop(audioDuration + delayBetweenSlides)
+        .loop(audioDuration + this.delayBetweenSlides)
         .input(audio)
         .outputOptions(
           compact([
@@ -159,41 +140,115 @@ export class VideoGenerationService {
     });
   }
 
-  // Function to check if file exists
-  private fileExists(filePath: string): boolean {
-    try {
-      return fs.existsSync(filePath);
-    } catch (err) {
-      return false;
-    }
+  private async processAllCrossfades(
+    tempVideos: string[],
+    introVideoPath: string,
+    outputFull: string,
+    outputShort: string,
+    start: number,
+    progressFn: (progress: number) => void,
+  ): Promise<string[]> {
+    let crossfades1: string[];
+    let crossfades2: string[];
+    const crossfadesStart = new Date().getTime() / 1000;
+    crossfades1 = await this.processCrossfades(
+      [introVideoPath, ...tempVideos],
+      1,
+      outputFull,
+      start,
+      progressFn,
+    );
+    crossfades2 = await this.processCrossfades(
+      [introVideoPath, tempVideos[0]],
+      1,
+      outputShort,
+      start,
+      null,
+    );
+
+    const crossfadesEnd = new Date().getTime() / 1000;
+    const crossfadesDiff = round(crossfadesEnd - crossfadesStart, 2);
+    const totalDiff = round(crossfadesEnd - start, 2);
+    this.log(`Crossfades took ${crossfadesDiff}s. Total time is ${totalDiff}s`);
+
+    return crossfades1.concat(crossfades2);
   }
 
-  // Function to get duration of a video file
-  private getVideoDuration(filePath: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-      if (!this.fileExists(filePath)) {
-        return reject(new Error(`File does not exist: ${filePath}`));
+  // Function to process list of videos from a text file
+  private async processCrossfades(
+    videoFiles: string[],
+    crossfadeDuration: number,
+    finalOutput: string,
+    start: number,
+    progressFn: (progress: number) => void,
+  ): Promise<string[]> {
+    const processedVideos: string[] = [];
+
+    if (videoFiles.length < 2) {
+      throw new Error('[ffmpeg]: At least two videos are required to create crossfade effect.');
+    }
+
+    let previousVideo = videoFiles[0];
+    let tempOutput: string;
+    this.makeFolder('temp');
+    for (let i = 1; i < videoFiles.length; i++) {
+      if (progressFn) {
+        progressFn(50 + round((i / videoFiles.length) * 49, 0));
       }
 
-      ffprobe(filePath, { path: ffprobePath.path }, (err, info) => {
-        if (err) return reject(err);
-        const duration = parseInt(info.streams[0].duration, 10);
-        resolve(duration);
-      });
-    });
+      const iterStart = new Date().getTime() / 1000;
+
+      const currentVideo = videoFiles[i];
+      tempOutput = path.join('temp', `crossfade_${i}.mp4`);
+      processedVideos.push(tempOutput);
+
+      await this.createCrossfade(
+        previousVideo,
+        currentVideo,
+        videoFiles[0],
+        tempOutput,
+        crossfadeDuration,
+        this.delayBetweenSlides - crossfadeDuration,
+        i,
+        videoFiles.length - 1,
+      );
+
+      previousVideo = tempOutput;
+
+      const iterEnd = new Date().getTime() / 1000;
+      const iterDiff = round(iterEnd - iterStart, 2);
+      const totalDiff = round(iterEnd - start, 2);
+      this.log(`Crossfade iteration ${i} took ${iterDiff}s. Total time is ${totalDiff}s`);
+    }
+
+    fs.renameSync(tempOutput, finalOutput);
+    console.log('[ffmpeg]: Final video with crossfade effect created successfully:', finalOutput);
+    return processedVideos;
+  }
+
+  // Function to create temp folder
+  private makeFolder(folder: string) {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder);
+    }
   }
 
   // Function to create crossfade effect between two videos
   private async createCrossfade(
     inputVideo1: string,
     inputVideo2: string,
+    inputVideo0: string,
     outputVideo: string,
     crossfadeDuration: number,
     delay: number,
     currentIndex: number,
     total: number,
   ): Promise<string> {
-    const duration1 = await this.getVideoDuration(inputVideo1);
+    let duration1 = await this.getVideoAttribute(inputVideo1, 'duration');
+    // add delay to the intro's end
+    if (inputVideo1 === inputVideo0) {
+      duration1 += 1;
+    }
     const transitionStart = Math.max(0, duration1 - crossfadeDuration);
 
     return new Promise((resolve, reject) => {
@@ -208,8 +263,7 @@ export class VideoGenerationService {
           // Extend the last frame of the video to pause
           `[vid]tpad=stop_mode=clone:stop_duration=${delay / 2}[viddelayed]`,
           // Audio delay and concat
-          `[1:a]adelay=${delay * 1000}|${delay * 1000}[a1];` +
-          `[0:a][a1]concat=n=2:v=0:a=1[aout]`,
+          `[1:a]adelay=${delay * 1000}|${delay * 1000}[a1];` + `[0:a][a1]concat=n=2:v=0:a=1[aout]`,
         ])
         .outputOptions('-map', '[viddelayed]')
         .outputOptions('-map', '[aout]')
@@ -221,9 +275,6 @@ export class VideoGenerationService {
             `[ffmpeg]: Crossfade (${currentIndex}/${total}). Spawned Ffmpeg with command: ${commandLine}`,
           );
         })
-        .on('stderr', (stderrLine) =>
-          console.log(`[ffmpeg] Crossfade (${currentIndex}/${total}). ${stderrLine}`),
-        )
         .on('progress', (progress) => {
           console.log(
             `[ffmpeg]: Crossfade (${currentIndex}/${total}). Processing. Target size is ${progress.targetSize}kb`,
@@ -241,48 +292,18 @@ export class VideoGenerationService {
     });
   }
 
-  // Function to create temp folder
-  private makeFolder(folder: string) {
-    if (!fs.existsSync(folder)) {
-      fs.mkdirSync(folder);
-    }
-  }
-
-  // Function to process list of videos from a text file
-  private async processVideos(
-    videoFiles: string[],
-    crossfadeDuration: number,
-    finalOutput: string,
-  ) {
-    try {
-      if (videoFiles.length < 2) {
-        throw new Error('At least two videos are required to create crossfade effect.');
+  // Function to get duration of a video file
+  private getVideoAttribute(filePath: string, attribute: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      if (!fileExists(filePath)) {
+        return reject(new Error(`[ffmpeg]: File does not exist: ${filePath}`));
       }
 
-      let previousVideo = videoFiles[0];
-      let tempOutput: string;
-      this.makeFolder('temp');
-      const pauseDuration = crossfadeDuration;
-
-      for (let i = 1; i < videoFiles.length; i++) {
-        const currentVideo = videoFiles[i];
-        tempOutput = path.join('temp', `crossfade_${i}.mp4`);
-
-        await this.createCrossfade(
-          previousVideo,
-          currentVideo,
-          tempOutput,
-          crossfadeDuration,
-          pauseDuration,
-          i,
-          videoFiles.length - 1,
-        );
-
-        previousVideo = tempOutput;
-      }
-
-      fs.renameSync(tempOutput, finalOutput);
-      console.log('Final video with crossfade effect created successfully:', finalOutput);
-    } catch {}
+      ffprobe(filePath, { path: ffprobePath.path }, (err, info) => {
+        if (err) return reject(err);
+        const value = parseInt(info.streams[0][attribute], 10);
+        resolve(value);
+      });
+    });
   }
 }
